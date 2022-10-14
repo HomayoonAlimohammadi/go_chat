@@ -1,48 +1,83 @@
 package server
 
 import (
-	chat "chat/proto"
-	"context"
+	"chat/chatpb"
 	"fmt"
+	"io"
 	"log"
 	"net"
 
-	"github.com/golang/protobuf/ptypes/empty"
 	"google.golang.org/grpc"
 )
 
-var messageChannel = make(chan chat.Message, 1)
+const (
+	webPort = 8000
+)
 
-const webPort = 8000
-
-type Server struct{}
-
-func (s Server) Join(emp *empty.Empty, server chat.ChatService_JoinServer) error {
-	msg := <-messageChannel
-	if err := server.Send(&msg); err != nil {
-		log.Println("Error sending message.")
-	}
-	return nil
+type ChatServiceServer struct {
+	chatpb.UnimplementedChatServiceServer
+	channels map[string][]chan *chatpb.Message
 }
 
-func (s Server) SendMessage(ctx context.Context, message *chat.Message) (*empty.Empty, error) {
-	messageChannel <- *message
-	return &empty.Empty{}, nil
+func (s *ChatServiceServer) JoinChannel(channel *chatpb.Channel, stream chatpb.ChatService_JoinChannelServer) error {
+	msgChannel := make(chan *chatpb.Message)
+	s.channels[channel.Name] = append(s.channels[channel.Name], msgChannel)
+	log.Printf("Added new channel for '%s' to '%s' channels\n", channel.SendersName, channel.Name)
+	log.Printf("number of users in channel '%s': '%d'\n", channel.Name, len(s.channels[channel.Name]))
+	for {
+		select {
+		case <-stream.Context().Done():
+			log.Printf("stream context for '%s' on channel '%s' is done, ending the conversation...\n", channel.SendersName, channel.Name)
+			return nil
+		case msg := <-msgChannel:
+			log.Printf("Recieved message from message channel '%s' sent by '%s': %s\n", channel.Name, channel.SendersName, msg)
+			stream.Send(msg)
+		}
+	}
+
+}
+
+func (s *ChatServiceServer) SendMessage(stream chatpb.ChatService_SendMessageServer) error {
+	msg, err := stream.Recv()
+	if err != nil {
+		return err
+	}
+	if err == io.EOF {
+		return nil
+	}
+
+	ack := &chatpb.MessageAck{
+		Status: "success",
+	}
+	stream.SendAndClose(ack)
+	channels := s.channels[msg.Channel.Name]
+	defer func() {
+		if x := recover(); x != nil {
+			log.Printf("unable to send: %v\n", x)
+		}
+	}()
+	for _, msgChan := range channels {
+		log.Printf("sending message '%s' to users in channel...\n", msg.Message)
+		msgChan <- msg
+		log.Println("done")
+	}
+	return nil
 }
 
 func Run() {
 	lis, err := net.Listen("tcp", fmt.Sprintf(":%d", webPort))
 	if err != nil {
-		log.Fatal("error listening on port:", webPort)
+		log.Fatal(err)
 	}
+	var opts []grpc.ServerOption
+	grpcServer := grpc.NewServer(opts...)
+	chatpb.RegisterChatServiceServer(grpcServer, &ChatServiceServer{
+		channels: make(map[string][]chan *chatpb.Message),
+	})
 
-	grpcServer := grpc.NewServer()
-	server := Server{}
-
-	chat.RegisterChatServiceServer(grpcServer, server)
-
-	log.Println("Starting server on port:", webPort)
-	if err := grpcServer.Serve(lis); err != nil {
-		log.Fatal("error running server on port:", webPort)
+	log.Println("Server is listening on port:", webPort)
+	err = grpcServer.Serve(lis)
+	if err != nil {
+		log.Fatal(err)
 	}
 }
