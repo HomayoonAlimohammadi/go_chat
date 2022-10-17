@@ -31,7 +31,10 @@ func (s *ChatServiceServer) JoinChannel(channel *chatpb.Channel, stream chatpb.C
 			return nil
 		case msg := <-msgChannel:
 			log.Printf("Recieved message from message channel '%s' sent by '%s': %s\n", channel.Name, channel.SendersName, msg)
-			stream.Send(msg)
+			err := stream.Send(msg)
+			if err != nil {
+				log.Println("Error sending message")
+			}
 		}
 	}
 
